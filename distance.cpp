@@ -7,6 +7,9 @@ MatrixXd Face_normal;
 MatrixXd Face_center;
 MatrixXi Face;
 
+// Hybrid energy weight (第一步过渡版本，后续可按 region 自适应)
+double omega = 0.5;
+
 
 Vector3d get_center(int i) {
   return Face_center.row(i);
@@ -76,16 +79,29 @@ double distance_L_2_1(int i, Vector3d N) {
   return Face_area(i)*n*n;
 };
 
-double distance(int i, Vector3d X, Vector3d N, MatrixXd V, int norme){
-  if (norme == 0){
+// 第一步过渡版本：hybrid = Ed + omega * En
+// 直接复用现有 distance_L_2 和 distance_L_2_1 的数学定义
+double distance_hybrid(int i, Vector3d X, Vector3d N, MatrixXd V, double om) {
+  return distance_L_2(i, X, N, V) + om * distance_L_2_1(i, N);
+};
+
+double distance(int i, Vector3d X, Vector3d N, MatrixXd V, MetricMode metric){
+  if (metric == L2_METRIC){
     return distance_L_2(i,X,N,V);
   }
-  else {
+  else if (metric == L21_METRIC) {
     return distance_L_2_1(i,N);
+  }
+  else if (metric == HYBRID_METRIC) {
+    return distance_hybrid(i, X, N, V, omega);
+  }
+  else {
+    cout<<"unknown metric mode"<<endl;
+    return 0;
   }
 };
 
-double global_distortion_error(MatrixXi R, MatrixXd Proxies, MatrixXd V, MatrixXi F, int norme){
+double global_distortion_error(MatrixXi R, MatrixXd Proxies, MatrixXd V, MatrixXi F, MetricMode metric){
 
   int p = Proxies.rows()/2; //number of proxies
   int f = F.rows(); //number of faces
@@ -104,7 +120,7 @@ double global_distortion_error(MatrixXi R, MatrixXd Proxies, MatrixXd V, MatrixX
     num_proxy = R(i,0);
     X = Proxies.row(num_proxy);
     N = Proxies.row(num_proxy+p);
-    e = distance(i,X,N,V,norme);
+    e = distance(i,X,N,V,metric);
     E += e;
 
   }

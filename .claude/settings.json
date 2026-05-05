@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"c:/Users/27009/libigl-project/VSA\" log --oneline -10)",
+      "Bash(git -C \"c:/Users/27009/libigl-project/VSA\" log --oneline --all)",
+      "Bash(git -C \"c:/Users/27009/libigl-project/VSA\" remote -v)",
+      "Bash(./variational_bin.exe smooth_bunny 180 0.3)",
+      "Read(//c/Users/27009/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/**)",
+      "Bash(cmake --build build/)",
+      "Bash(ninja)",
+      "Bash(cmake -DFETCHCONTENT_SOURCE_DIR_EIGEN=\"c:/Users/27009/libigl-project/VSA/build/_deps/eigen-src\" ..)",
+      "Bash(cmake -DFETCHCONTENT_SOURCE_DIR_EIGEN=\"c:/Users/27009/libigl-project/VSA/build/_deps/eigen-src\" -DFETCHCONTENT_SOURCE_DIR_GLAD=\"c:/Users/27009/libigl-project/VSA/build/_deps/glad-src\" -DFETCHCONTENT_SOURCE_DIR_GLFW=\"c:/Users/27009/libigl-project/VSA/build/_deps/glfw-src\" -G Ninja ..)",
+      "WebSearch"
+    ]
+  }
+}

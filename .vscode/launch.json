@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run VSA",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/variational_bin.exe",
+            "args": ["fandisk", "3", "0.3"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "console": "integratedTerminal",
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:/Users/27009/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/gdb.exe",
+            "preLaunchTask": "Build"
+        }
+    ]
+}

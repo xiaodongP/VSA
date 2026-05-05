@@ -1,0 +1,19 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/../libigl/include",
+                "${workspaceFolder}/build/_deps/eigen-src",
+                "${workspaceFolder}/build/_deps/glfw-src/include",
+                "${workspaceFolder}/build/_deps/glad-src/include"
+            ],
+            "compilerPath": "C:/Users/27009/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/g++.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "gcc-x64"
+        }
+    ],
+    "version": 4
+}
