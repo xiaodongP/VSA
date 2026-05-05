@@ -129,9 +129,10 @@ MatrixXd compute_N (MatrixXi R, MatrixXi F, MatrixXd V, int p) {
   for (int f=0 ; f<R.rows() ; f++){
     //we only add the triangles that belong to the region i
     int i = R(f,0);
+    if (i < 0 || i >= p) continue;
 
     s = get_area(f);
-    nT = get_normal(f); 
+    nT = get_normal(f);
 
     N.row(i) += s*nT;
   }

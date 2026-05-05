@@ -1,6 +1,7 @@
 #include "partitioning.h"
 #include "distance.h"
 #include "proxies.h"
+#include "feature_barrier.h"
 #include <limits>
 
 //******************Partitionning******************
@@ -118,6 +119,7 @@ int find_triangles_region(vector<int> Triangles, MatrixXi &R, MatrixXd V, Matrix
     Proxies_normal[i] = get_normal(Triangles[i]);
     R(Triangles[i]) = i;
     for (int k=0;k<3;k++) {
+        if (is_feature_barrier(Triangles[i], k, F, Ad)) continue;
         int tri = Ad(Triangles[i],k);
         double d = distance(tri, Proxies_center[i], Proxies_normal[i], V, metric);
         q.push(make_pair(-d, tri+m*(i)));
@@ -138,12 +140,13 @@ int find_triangles_region(vector<int> Triangles, MatrixXi &R, MatrixXd V, Matrix
     q.pop();
     prox = item.second/m;
     face = item.second%m;
-    
+
 
     if (R(face)==-1) {
       R(face) = prox;
 
       for (int k=0;k<3;k++) {
+        if (is_feature_barrier(face, k, F, Ad)) continue;
         int tri = Ad(face,k);
         double d = distance(tri, Proxies_center[prox], Proxies_normal[prox], V, metric);
         q.push(make_pair(-d, tri+m*prox));
@@ -151,6 +154,18 @@ int find_triangles_region(vector<int> Triangles, MatrixXi &R, MatrixXd V, Matrix
           furthest_distance(prox)=d;
           furthest_triangle(prox)=tri;
         }
+      }
+    }
+  }
+
+  // Assign any remaining -1 faces to a neighbor's region
+  for (int i=0; i<m; i++) {
+    if (R(i) >= 0) continue;
+    for (int k=0; k<3; k++) {
+      int nb = Ad(i,k);
+      if (nb >= 0 && R(nb) >= 0) {
+        R(i) = R(nb);
+        break;
       }
     }
   }
@@ -224,6 +239,7 @@ void proxy_color(MatrixXi &R, MatrixXd Proxies, MatrixXd V, MatrixXi F, MatrixXi
     R(triangles(i)) = i;
     error += distance(triangles(i), Proxies_center[i], Proxies_normal[i], V, metric);
     for (int k=0;k<3;k++) {
+        if (is_feature_barrier(triangles(i), k, F, Ad)) continue;
         int tri = Ad(triangles(i),k);
         double d = distance(tri, Proxies_center[i], Proxies_normal[i], V, metric);
         q.push(make_pair(-d, tri+m*(i)));
@@ -239,16 +255,28 @@ void proxy_color(MatrixXi &R, MatrixXd Proxies, MatrixXd V, MatrixXi F, MatrixXi
     q.pop();
     prox = item.second/m;
     face = item.second%m;
-    
+
 
     if (R(face)==-1) {
       R(face) = prox;
       for (int k=0;k<3;k++) {
+        if (is_feature_barrier(face, k, F, Ad)) continue;
         int tri = Ad(face,k);
         double d = distance(tri, Proxies_center[prox], Proxies_normal[prox], V, metric);
         q.push(make_pair(-d, tri+m*prox));
       }
     }
   }
-}
 
+  // Assign any remaining -1 faces to a neighbor's region
+  for (int i=0; i<m; i++) {
+    if (R(i) >= 0) continue;
+    for (int k=0; k<3; k++) {
+      int nb = Ad(i,k);
+      if (nb >= 0 && R(nb) >= 0) {
+        R(i) = R(nb);
+        break;
+      }
+    }
+  }
+}

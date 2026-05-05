@@ -48,6 +48,18 @@ struct ProxyValidityReport {
     VectorXd singular_values_H;  // size 4
     Vector3d eigenvalues_Q;      // sorted ascending
     double sigma3_ratio;         // sigma3/sigma2 of H
+
+    // Validity-guided insertion fields
+    bool is_suspicious;          // near-degenerate but not invalid
+    int priority;                // higher = more urgent to split
+    int face_count;              // faces in this region
+
+    // Individual boolean flags (derived from invalid_reason bitmask)
+    bool basic_invalid_flag;
+    bool pair_of_planes_flag;
+    bool near_pair_of_planes_flag;
+    bool rank_deficient_flag;
+    bool two_sheet_crossing_flag;
 };
 
 struct ProxyValidityConfig {
@@ -100,5 +112,16 @@ void print_proxy_validity(const ProxyValidityReport& rpt);
 // CSV export
 void export_proxy_validity_log(const vector<ProxyValidityReport>& reports,
     const string& filename);
+
+// Validity-guided split selection
+int choose_region_to_split_by_validity(
+    const vector<ProxyValidityReport>& reports,
+    int min_faces_to_split = 4);
+
+// Seed face selection for invalid regions
+int choose_seed_face_for_invalid_region(
+    int region_id, const ProxyValidityReport& report,
+    const MatrixXi& R, const MatrixXi& F, const MatrixXd& V,
+    const vector<QuadricProxy>& QP);
 
 #endif

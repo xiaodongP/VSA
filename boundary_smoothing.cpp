@@ -2,6 +2,7 @@
 #include <igl/opengl/glfw/Viewer.h>
 #include "boundary_smoothing.h"
 #include "maxflow.h"
+#include "feature_barrier.h"
 #include "distance.h"
 #include <queue>
 #include <set>
@@ -102,6 +103,7 @@ double compute_pair_boundary_length(const MatrixXi& R, const MatrixXi& F,
 
 // Build region adjacency pairs
 static set<pair<int,int>> build_region_pairs(const MatrixXi& R,
+                                              const MatrixXi& F,
                                               const MatrixXi& Ad,
                                               int num_proxies) {
     set<pair<int,int>> pairs;
@@ -114,6 +116,7 @@ static set<pair<int,int>> build_region_pairs(const MatrixXi& R,
             if (nb <= 0 || nb >= m) continue;
             int rj = R(nb, 0);
             if (rj < 0 || rj >= num_proxies || rj == ri) continue;
+            if (is_feature_barrier(fi, k, F, Ad)) continue;
             pairs.insert(make_pair(min(ri, rj), max(ri, rj)));
         }
     }
@@ -283,6 +286,7 @@ static SmoothLogEntry smooth_pair(MatrixXi& R, const MatrixXi& F,
     for (int nid = 0; nid < N; nid++) {
         int fi = node_to_face[nid];
         for (int k = 0; k < 3; k++) {
+            if (is_feature_barrier(fi, k, F, Ad)) continue;
             int nb = Ad(fi, k);
             if (nb <= 0 || nb >= m) continue;
             auto it = face_to_node.find(nb);
@@ -331,7 +335,7 @@ void smooth_boundaries(MatrixXi& R, const MatrixXi& F, const MatrixXd& V,
     log_out.clear();
     double avg_el = avg_edge_length(F, V);
 
-    set<pair<int,int>> pairs = build_region_pairs(R, Ad, num_proxies);
+    set<pair<int,int>> pairs = build_region_pairs(R, F, Ad, num_proxies);
 
     cout << "\n=== Boundary Smoothing ===" << endl;
     cout << "  " << pairs.size() << " adjacent pairs, ring=" << cfg.ring

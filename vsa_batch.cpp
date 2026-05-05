@@ -6,6 +6,7 @@
 #include "proxy_validity.h"
 #include "proxy_classification.h"
 #include "proxy_projection.h"
+#include "feature_barrier.h"
 #include "distance.h"
 #include "partitioning.h"
 #include "proxies.h"
@@ -50,6 +51,7 @@ static void flood_regions_quadric(MatrixXi& R, const vector<int>& seeds,
     for (int i = 0; i < p; i++) {
         R(seeds[i], 0) = i;
         for (int k = 0; k < 3; k++) {
+            if (is_feature_barrier(seeds[i], k, F, Ad)) continue;
             int nb = Ad(seeds[i], k);
             if (nb < 0) continue;
             double d = face_quadric_error(nb, QP[i], F, V);
@@ -64,10 +66,23 @@ static void flood_regions_quadric(MatrixXi& R, const vector<int>& seeds,
         if (R(face, 0) != -1) continue;
         R(face, 0) = prox;
         for (int k = 0; k < 3; k++) {
+            if (is_feature_barrier(face, k, F, Ad)) continue;
             int nb = Ad(face, k);
             if (nb < 0 || R(nb, 0) != -1) continue;
             double d = face_quadric_error(nb, QP[prox], F, V);
             q.push(make_pair(-d, nb + m * prox));
+        }
+    }
+
+    // Assign any remaining -1 faces to a neighbor's proxy
+    for (int i = 0; i < m; i++) {
+        if (R(i, 0) >= 0) continue;
+        for (int k = 0; k < 3; k++) {
+            int nb = Ad(i, k);
+            if (nb >= 0 && R(nb, 0) >= 0) {
+                R(i, 0) = R(nb, 0);
+                break;
+            }
         }
     }
 }
@@ -632,13 +647,33 @@ static void export_insertion_log(const vector<InsertionStep>& log,
                                   const string& filename) {
     ofstream fout(filename);
     if (!fout.is_open()) { cerr << "Cannot write " << filename << endl; return; }
-    fout << "step,num_proxies_before,split_region,split_region_error,"
-         << "seed_face,seed_face_error,total_error_after_lloyd" << endl;
+    fout << "step,K_before,K_after,split_mode,split_region,split_region_error,"
+         << "seed_face,seed_face_error,total_error_after_lloyd,"
+         << "validity_priority,invalid_reason,detected_quadric_type,"
+         << "condition_H,condition_Q,"
+         << "max_region_error_before,max_region_error_after,"
+         << "invalid_proxy_count_before,invalid_proxy_count_after,"
+         << "stop_reason" << endl;
     for (const auto& s : log) {
-        fout << s.step << "," << s.num_proxies_before << ","
-             << s.split_region << "," << s.split_region_error << ","
-             << s.seed_face << "," << s.seed_face_error << ","
-             << s.total_error_after_lloyd << endl;
+        fout << s.step << ","
+             << s.num_proxies_before << ","
+             << (s.num_proxies_before + 1) << ","
+             << s.split_mode << ","
+             << s.split_region << ","
+             << s.split_region_error << ","
+             << s.seed_face << ","
+             << s.seed_face_error << ","
+             << s.total_error_after_lloyd << ","
+             << s.validity_priority << ","
+             << "\"" << s.invalid_reason << "\","
+             << "\"" << s.detected_quadric_type << "\","
+             << s.condition_H << ","
+             << s.condition_Q << ","
+             << s.max_region_error_before << ","
+             << s.max_region_error_after << ","
+             << s.invalid_proxy_count_before << ","
+             << s.invalid_proxy_count_after << ","
+             << "\"" << s.stop_reason << "\"" << endl;
     }
     fout.close();
     cout << "Exported insertion log: " << filename << endl;
@@ -684,6 +719,12 @@ static vector<MergeCandidate> find_merge_candidates(
     vector<MergeCandidate> accepted;
 
     for (auto& [ri, rj] : adj) {
+        // Feature barrier: don't merge across feature edges
+        if (g_feature_barrier_enabled && !g_feature_edges.empty() &&
+            count_feature_edges_on_boundary(R, F, Ad, ri, rj) > 0) {
+            continue;
+        }
+
         MergeStep ms;
         ms.region_i = ri;
         ms.region_j = rj;
@@ -834,6 +875,12 @@ static vector<pair<int,int>> find_merge_candidates_plane(
     vector<pair<double,pair<int,int>>> scored;
 
     for (auto& [ri, rj] : adj) {
+        // Feature barrier: don't merge across feature edges
+        if (g_feature_barrier_enabled && !g_feature_edges.empty() &&
+            count_feature_edges_on_boundary(R, F, Ad, ri, rj) > 0) {
+            continue;
+        }
+
         MergeStep ms;
         ms.region_i = ri; ms.region_j = rj;
         ms.epsilon = epsilon; ms.accepted = false;
@@ -936,7 +983,11 @@ int run_vsa_progressive(const string& model_name,
                         bool enable_classify,
                         double classify_eps,
                         bool enable_projection,
-                        ProjectionConfig proj_cfg)
+                        ProjectionConfig proj_cfg,
+                        bool validity_guided,
+                        int max_validity_split_attempts,
+                        int min_faces_to_split,
+                        bool export_validity_each_step)
 {
     srand(seed);
     stats_out.clear();
@@ -1007,29 +1058,107 @@ int run_vsa_progressive(const string& model_name,
     }
 
     // Step 3: Progressive insertion loop
+    int prev_invalid_count = 0;
+    int consecutive_validity_splits = 0;
+
     for (int step = 1; ; step++) {
+        // === Validity check ===
+        vector<ProxyValidityReport> reports;
+        int invalid_count = 0;
+        if (validity_guided && proxy_type == QUADRIC_PROXY) {
+            ProxyValidityConfig full_cfg = validity_cfg;
+            full_cfg.enable_basic = true;
+            full_cfg.enable_degeneracy = true;
+            full_cfg.enable_classification = true;
+            full_cfg.enable_two_sheet = true;
+
+            reports = check_all_proxies(QP, R, F, V, full_cfg);
+            for (auto& rpt : reports) {
+                if (!rpt.is_valid || rpt.is_suspicious) invalid_count++;
+            }
+            cout << "[Progressive] K=" << num_proxies
+                 << " max_region_error=" << st.max_region_error
+                 << " invalid_proxy_count=" << invalid_count << endl;
+
+            if (export_validity_each_step) {
+                export_proxy_validity_log(reports,
+                    model_name + "_validity_K" + to_string(num_proxies) + ".csv");
+            }
+        }
+
+        // === Stopping criteria ===
         bool stop = false;
+        string stop_reason;
 
-        // Check stopping criteria
-        if (target_proxies > 0 && num_proxies >= target_proxies) {
-            cout << "\n[stop] Reached target " << target_proxies << " proxies." << endl;
+        if (num_proxies >= (int)(F.rows() / 2)) {
             stop = true;
+            stop_reason = "too_many_proxies";
         }
-        if (error_threshold > 0 && st.max_region_error < error_threshold) {
-            cout << "\n[stop] Max region error " << st.max_region_error
-                 << " < threshold " << error_threshold << endl;
-            stop = true;
+        if (!stop && target_proxies > 0 && num_proxies >= target_proxies) {
+            if (!validity_guided || invalid_count == 0) {
+                stop = true;
+                stop_reason = "target_reached";
+            } else {
+                cout << "  [validity] Target reached but " << invalid_count
+                     << " invalid proxies remain, continuing." << endl;
+            }
         }
-        if (num_proxies >= F.rows() / 2) {
-            cout << "\n[stop] Too many proxies (" << num_proxies
-                 << "), stopping to avoid degeneracy." << endl;
-            stop = true;
+        if (!stop && error_threshold > 0 && st.max_region_error < error_threshold) {
+            if (!validity_guided || invalid_count == 0) {
+                stop = true;
+                stop_reason = "error_threshold_met";
+            } else {
+                cout << "  [validity] Error threshold met but " << invalid_count
+                     << " invalid proxies remain, continuing." << endl;
+            }
         }
-        if (stop) break;
+        if (stop) {
+            cout << "\n[stop] " << stop_reason << " (K=" << num_proxies << ")" << endl;
+            if (!insertion_log_out.empty())
+                insertion_log_out.back().stop_reason = stop_reason;
+            break;
+        }
 
-        // Find split candidate
-        SplitInfo split = find_split_candidate(
-            R, F, V, proxy_type, QP, Proxies, metric, num_proxies);
+        // === Choose split ===
+        string split_mode = "max_error";
+        SplitInfo split;
+        split.region_id = -1;
+        split.seed_face = -1;
+        double split_condition_H = 0, split_condition_Q = 0;
+        int split_priority = 0;
+        string split_invalid_reason;
+        string split_quadric_type;
+
+        if (validity_guided && invalid_count > 0 && proxy_type == QUADRIC_PROXY &&
+            consecutive_validity_splits < max_validity_split_attempts) {
+            int region_id = choose_region_to_split_by_validity(reports, min_faces_to_split);
+            if (region_id >= 0) {
+                auto& rpt = reports[region_id];
+                int seed = choose_seed_face_for_invalid_region(
+                    region_id, rpt, R, F, V, QP);
+                if (seed >= 0) {
+                    split.region_id = region_id;
+                    split.region_error = rpt.region_error;
+                    split.seed_face = seed;
+                    split.seed_face_error = face_quadric_error(seed, QP[region_id], F, V);
+                    split_condition_H = rpt.h_condition;
+                    split_condition_Q = rpt.q_condition;
+                    split_priority = rpt.priority;
+                    split_invalid_reason = rpt.invalid_reason_str;
+                    split_quadric_type = quadric_type_name(rpt.quadric_type);
+
+                    if (!rpt.is_valid) split_mode = "invalid_proxy";
+                    else split_mode = "suspicious_proxy";
+                }
+            }
+        }
+
+        if (split.seed_face < 0) {
+            // Fallback to max-error split
+            split = find_split_candidate(
+                R, F, V, proxy_type, QP, Proxies, metric, num_proxies);
+            split_mode = "max_error";
+        }
 
         if (split.seed_face < 0) {
             cout << "\n[stop] No valid split face found." << endl;
@@ -1037,11 +1166,17 @@ int run_vsa_progressive(const string& model_name,
         }
 
         cout << "\n=== Insertion step " << step << " ===" << endl;
-        cout << "  split region " << split.region_id
-             << " (norm_err=" << split.region_error << ")"
-             << " at face " << split.seed_face
+        cout << "  selected split mode = " << split_mode << endl;
+        cout << "  selected region = " << split.region_id
+             << " (norm_err=" << split.region_error << ")" << endl;
+        cout << "  selected seed face = " << split.seed_face
              << " (face_err=" << split.seed_face_error << ")" << endl;
+        if (split_mode != "max_error") {
+            cout << "  reason = " << split_invalid_reason
+                 << " (priority=" << split_priority << ")" << endl;
+        }
 
+        // Build log entry
         InsertionStep ilog;
         ilog.step = step;
         ilog.num_proxies_before = num_proxies;
@@ -1049,6 +1184,14 @@ int run_vsa_progressive(const string& model_name,
         ilog.split_region_error = split.region_error;
         ilog.seed_face = split.seed_face;
         ilog.seed_face_error = split.seed_face_error;
+        ilog.split_mode = split_mode;
+        ilog.invalid_reason = split_invalid_reason;
+        ilog.detected_quadric_type = split_quadric_type;
+        ilog.validity_priority = split_priority;
+        ilog.condition_H = split_condition_H;
+        ilog.condition_Q = split_condition_Q;
+        ilog.max_region_error_before = st.max_region_error;
+        ilog.invalid_proxy_count_before = invalid_count;
 
         // Insert proxy
         insert_one_proxy(R, F, V, proxy_type, num_proxies, QP, Proxies, split);
@@ -1060,36 +1203,45 @@ int run_vsa_progressive(const string& model_name,
             R, V, F, Ad, proxy_type, metric, num_proxies,
             lloyd_iter_per_insert, QP, Proxies, stats_out, global_iter);
 
-        // Validity check + repair after insertion
-        if (proxy_type == QUADRIC_PROXY && validity_cfg.enable_basic) {
-            for (int repair = 0; repair < 3; repair++) {
-                auto reports = check_all_proxies(QP, R, F, V, validity_cfg);
-                vector<int> invalid;
-                for (auto& rpt : reports) {
-                    if (!rpt.is_valid) {
-                        print_proxy_validity(rpt);
-                        invalid.push_back(rpt.proxy_id);
-                    }
-                }
-                if (invalid.empty()) break;
-                cout << "  [validity] " << invalid.size() << " invalid proxies, repairing..." << endl;
-                for (int rid : invalid) {
-                    int wf = find_worst_face_in_region(QP[rid], rid, R, F, V);
-                    if (wf < 0) continue;
-                    SplitInfo split{rid, reports[rid].region_error, wf, 0.0};
-                    insert_one_proxy(R, F, V, proxy_type, num_proxies, QP, Proxies, split);
-                    cout << "    repaired proxy " << rid << ", total=" << num_proxies << endl;
-                }
-                st = run_lloyd_to_convergence(R, V, F, Ad, proxy_type, metric,
-                    num_proxies, lloyd_iter_per_insert, QP, Proxies, stats_out, global_iter);
+        ilog.total_error_after_lloyd = st.total_error;
+        ilog.max_region_error_after = st.max_region_error;
+
+        // Track consecutive validity splits
+        if (split_mode != "max_error") {
+            if (invalid_count >= prev_invalid_count) {
+                consecutive_validity_splits++;
+            } else {
+                consecutive_validity_splits = 0;
             }
+        } else {
+            consecutive_validity_splits = 0;
+        }
+        prev_invalid_count = invalid_count;
+
+        // Post-insertion validity count for logging
+        if (validity_guided && proxy_type == QUADRIC_PROXY) {
+            ProxyValidityConfig full_cfg = validity_cfg;
+            full_cfg.enable_basic = true;
+            full_cfg.enable_degeneracy = true;
+            full_cfg.enable_classification = true;
+            full_cfg.enable_two_sheet = true;
+            auto post_reports = check_all_proxies(QP, R, F, V, full_cfg);
+            int post_invalid = 0;
+            for (auto& rpt : post_reports)
+                if (!rpt.is_valid || rpt.is_suspicious) post_invalid++;
+            ilog.invalid_proxy_count_after = post_invalid;
         }
 
-        ilog.total_error_after_lloyd = st.total_error;
         insertion_log_out.push_back(ilog);
 
         cout << "  After insertion: total_err=" << st.total_error
-             << " max_region_err=" << st.max_region_error << endl;
+             << " max_region_err=" << st.max_region_error
+             << " invalid_proxies=" << ilog.invalid_proxy_count_after << endl;
+
+        if (consecutive_validity_splits >= max_validity_split_attempts) {
+            cout << "[warning] " << max_validity_split_attempts
+                 << " consecutive validity splits without improvement" << endl;
+        }
     }
 
     // Post-loop merge phase
@@ -1251,4 +1403,68 @@ int run_vsa_progressive(const string& model_name,
     R_out = R;
     cout << "\nProgressive VSA complete. Final proxies: " << num_proxies << endl;
     return 0;
+}
+
+// ============================================================
+// Merge pass (reuses existing static functions)
+// ============================================================
+
+int run_merge_pass(MatrixXi& R, vector<QuadricProxy>& QP, MatrixXd& Proxies,
+                   int& num_proxies, ProxyType proxy_type, MetricMode metric,
+                   const MatrixXi& F, const MatrixXd& V, const MatrixXi& Ad,
+                   double relative_threshold, int max_iterations) {
+    if (num_proxies < 2) return 0;
+    int merge_count = 0;
+
+    for (int it = 0; it < max_iterations; it++) {
+        // Compute max region error for epsilon
+        vector<double> re(num_proxies, 0), ra(num_proxies, 0);
+        for (int i = 0; i < F.rows(); i++) {
+            int j = R(i, 0);
+            if (j < 0 || j >= num_proxies) continue;
+            double e;
+            if (proxy_type == QUADRIC_PROXY)
+                e = face_quadric_error(i, QP[j], F, V);
+            else
+                e = distance(i, Proxies.row(j), Proxies.row(j + num_proxies), V, metric);
+            re[j] += e;
+            ra[j] += face_area(i, F, V);
+        }
+        double max_ne = 0;
+        for (int j = 0; j < num_proxies; j++) {
+            double ne = ra[j] > 1e-15 ? re[j] / ra[j] : 0;
+            if (ne > max_ne) max_ne = ne;
+        }
+
+        double epsilon = relative_threshold * max_ne;
+        if (epsilon < 1e-15) break;
+
+        bool merged = false;
+        if (proxy_type == QUADRIC_PROXY) {
+            vector<MergeStep> evaluated;
+            auto candidates = find_merge_candidates(
+                R, F, V, Ad, QP, num_proxies, epsilon, evaluated);
+            if (!candidates.empty()) {
+                auto& best = candidates[0];
+                cout << "  merge: region " << best.ri << " + " << best.rj
+                     << " (delta=" << best.delta << " < eps=" << epsilon << ")" << endl;
+                execute_merge(R, QP, num_proxies, best.ri, best.rj, F, V);
+                merge_count++;
+                merged = true;
+            }
+        } else {
+            vector<MergeStep> evaluated;
+            auto candidates = find_merge_candidates_plane(
+                R, F, V, Ad, Proxies, num_proxies, metric, epsilon, evaluated);
+            if (!candidates.empty()) {
+                auto& [ri, rj] = candidates[0];
+                cout << "  merge: region " << ri << " + " << rj << endl;
+                execute_merge_plane(R, Proxies, num_proxies, ri, rj, F, V);
+                merge_count++;
+                merged = true;
+            }
+        }
+        if (!merged) break;
+    }
+    return merge_count;
 }

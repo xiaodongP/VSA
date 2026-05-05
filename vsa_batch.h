@@ -36,6 +36,26 @@ struct InsertionStep {
     int seed_face;
     double seed_face_error;
     double total_error_after_lloyd;
+
+    // Validity-guided fields
+    string split_mode;               // "max_error", "invalid_proxy", "suspicious_proxy"
+    string invalid_reason;
+    string detected_quadric_type;
+    int validity_priority;
+    double condition_H;
+    double condition_Q;
+    double max_region_error_before;
+    double max_region_error_after;
+    int invalid_proxy_count_before;
+    int invalid_proxy_count_after;
+    string stop_reason;
+
+    InsertionStep() : step(0), num_proxies_before(0), split_region(-1),
+        split_region_error(0), seed_face(-1), seed_face_error(0),
+        total_error_after_lloyd(0), split_mode("max_error"),
+        validity_priority(0), condition_H(0), condition_Q(0),
+        max_region_error_before(0), max_region_error_after(0),
+        invalid_proxy_count_before(0), invalid_proxy_count_after(0) {}
 };
 
 struct MergeStep {
@@ -73,6 +93,17 @@ int run_vsa_progressive(const string& model_name,
                         bool enable_classify = false,
                         double classify_eps = 0.1,
                         bool enable_projection = false,
-                        ProjectionConfig proj_cfg = ProjectionConfig());
+                        ProjectionConfig proj_cfg = ProjectionConfig(),
+                        bool validity_guided = false,
+                        int max_validity_split_attempts = 20,
+                        int min_faces_to_split = 4,
+                        bool export_validity_each_step = false);
+
+// Run merge pass: iteratively merge adjacent region pairs.
+// Returns number of merged pairs.
+int run_merge_pass(MatrixXi& R, vector<QuadricProxy>& QP, MatrixXd& Proxies,
+                   int& num_proxies, ProxyType proxy_type, MetricMode metric,
+                   const MatrixXi& F, const MatrixXd& V, const MatrixXi& Ad,
+                   double relative_threshold, int max_iterations);
 
 #endif

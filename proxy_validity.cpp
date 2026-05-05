@@ -376,6 +376,14 @@ ProxyValidityReport check_proxy_validity(const QuadricProxy& proxy,
     rpt.sigma3_ratio = 0;
     rpt.singular_values_H = VectorXd::Zero(4);
     rpt.eigenvalues_Q = Vector3d::Zero(3);
+    rpt.is_suspicious = false;
+    rpt.priority = 0;
+    rpt.face_count = 0;
+    rpt.basic_invalid_flag = false;
+    rpt.pair_of_planes_flag = false;
+    rpt.near_pair_of_planes_flag = false;
+    rpt.rank_deficient_flag = false;
+    rpt.two_sheet_crossing_flag = false;
 
     // Compute region error
     rpt.region_error = compute_region_error(proxy, proxy_id, R, F, V);
@@ -414,6 +422,33 @@ ProxyValidityReport check_proxy_validity(const QuadricProxy& proxy,
     // Finalize
     rpt.is_valid = (rpt.invalid_reason == VALID_OK);
     rpt.invalid_reason_str = invalid_reason_string(rpt.invalid_reason);
+
+    // Count faces in this region
+    for (int i = 0; i < F.rows(); i++) {
+        if (R(i, 0) == proxy_id) rpt.face_count++;
+    }
+
+    // Set individual boolean flags
+    rpt.pair_of_planes_flag = (rpt.invalid_reason & INVALID_PAIR_OF_PLANES) != 0;
+    rpt.near_pair_of_planes_flag = (rpt.invalid_reason & INVALID_NEAR_PLANES) != 0;
+    rpt.rank_deficient_flag = (rpt.invalid_reason & INVALID_RANK_DEFICIENT) != 0;
+    rpt.two_sheet_crossing_flag = (rpt.invalid_reason & INVALID_TWO_SHEET_SPAN) != 0;
+    rpt.basic_invalid_flag = (rpt.invalid_reason & (INVALID_NAN_INF | INVALID_COEFF_NORM |
+        INVALID_H_ILL_COND | INVALID_Q_ILL_COND | INVALID_REGION_ERROR)) != 0;
+
+    // Determine is_suspicious: near-degenerate but not strictly invalid
+    rpt.is_suspicious = rpt.is_valid && rpt.near_pair_of_planes_flag;
+
+    // Compute priority for split ordering
+    // 7=pair_of_planes, 6=near_pair, 5=two_sheet, 4=rank_deficient,
+    // 3=basic_invalid, 2=suspicious, 1=valid, 0=unused
+    if (rpt.pair_of_planes_flag) rpt.priority = 7;
+    else if (rpt.near_pair_of_planes_flag && !rpt.is_valid) rpt.priority = 6;
+    else if (rpt.two_sheet_crossing_flag) rpt.priority = 5;
+    else if (rpt.rank_deficient_flag) rpt.priority = 4;
+    else if (rpt.basic_invalid_flag) rpt.priority = 3;
+    else if (rpt.is_suspicious) rpt.priority = 2;
+    else rpt.priority = 1;
 
     return rpt;
 }
@@ -481,4 +516,184 @@ void export_proxy_validity_log(const vector<ProxyValidityReport>& reports,
     }
     fout.close();
     cout << "Exported proxy validity log: " << filename << endl;
+}
+
+// ============================================================
+// Choose region to split based on validity reports
+// ============================================================
+
+int choose_region_to_split_by_validity(
+    const vector<ProxyValidityReport>& reports,
+    int min_faces_to_split)
+{
+    int best_id = -1;
+    int best_priority = -1;
+    double best_error = -1;
+    int best_faces = -1;
+
+    for (const auto& r : reports) {
+        if (r.is_valid && !r.is_suspicious) continue;
+        if (r.face_count < min_faces_to_split) continue;
+
+        bool better = false;
+        if (r.priority > best_priority) better = true;
+        else if (r.priority == best_priority) {
+            if (r.region_error > best_error) better = true;
+            else if (r.region_error == best_error) {
+                if (r.face_count > best_faces) better = true;
+                else if (r.face_count == best_faces && (best_id < 0 || r.proxy_id < best_id))
+                    better = true;
+            }
+        }
+
+        if (better) {
+            best_id = r.proxy_id;
+            best_priority = r.priority;
+            best_error = r.region_error;
+            best_faces = r.face_count;
+        }
+    }
+    return best_id;
+}
+
+// ============================================================
+// Seed face selection for invalid regions
+// ============================================================
+
+int choose_seed_face_for_invalid_region(
+    int region_id, const ProxyValidityReport& report,
+    const MatrixXi& R, const MatrixXi& F, const MatrixXd& V,
+    const vector<QuadricProxy>& QP)
+{
+    // Collect faces in the region
+    vector<int> region_faces;
+    for (int i = 0; i < F.rows(); i++) {
+        if (R(i, 0) == region_id) region_faces.push_back(i);
+    }
+    if (region_faces.empty()) return -1;
+
+    // Helper: compute quadric error for a face
+    auto qerr = [&](int fi) -> double {
+        Vector3i f = F.row(fi);
+        return QP[region_id].triangle_error(
+            v3(V.row(f(0))), v3(V.row(f(1))), v3(V.row(f(2))));
+    };
+
+    // A. Pair-of-planes / near-pair-of-planes: k=2 normal clustering
+    if (report.pair_of_planes_flag || report.near_pair_of_planes_flag) {
+        vector<Vector3d> normals;
+        for (int fi : region_faces) {
+            Vector3i f = F.row(fi);
+            Vector3d v0 = v3(V.row(f(0))), v1 = v3(V.row(f(1))), v2 = v3(V.row(f(2)));
+            Vector3d n = (v1 - v0).cross(v2 - v0);
+            if (n.norm() > 1e-12) n.normalize();
+            else n = Vector3d::Zero();
+            normals.push_back(n);
+        }
+
+        // Simple k=2: seed1 = furthest from mean, seed2 = furthest from seed1
+        Vector3d mean_n = Vector3d::Zero();
+        for (auto& n : normals) mean_n += n;
+        double mean_norm = mean_n.norm();
+        if (mean_norm > 1e-12) mean_n /= mean_norm;
+
+        int seed1 = 0;
+        double max_dist = -1;
+        for (int i = 0; i < (int)normals.size(); i++) {
+            double d = 1.0 - abs(normals[i].dot(mean_n));
+            if (d > max_dist) { max_dist = d; seed1 = i; }
+        }
+
+        int seed2 = 0;
+        max_dist = -1;
+        for (int i = 0; i < (int)normals.size(); i++) {
+            double d = 1.0 - abs(normals[i].dot(normals[seed1]));
+            if (d > max_dist) { max_dist = d; seed2 = i; }
+        }
+
+        // Assign faces to two clusters
+        vector<int> cluster_a, cluster_b;
+        for (int i = 0; i < (int)normals.size(); i++) {
+            if (abs(normals[i].dot(normals[seed1])) >= abs(normals[i].dot(normals[seed2])))
+                cluster_a.push_back(i);
+            else
+                cluster_b.push_back(i);
+        }
+
+        // Pick from smaller cluster, choose max-error face within it
+        auto& chosen = (cluster_a.size() <= cluster_b.size()) ? cluster_a : cluster_b;
+        int best_face = -1;
+        double best_err = -1;
+        for (int idx : chosen) {
+            double e = qerr(region_faces[idx]);
+            if (e > best_err) { best_err = e; best_face = region_faces[idx]; }
+        }
+        if (best_face >= 0) return best_face;
+    }
+
+    // B. Two-sheet crossing: split by side of separating hyperboloid
+    if (report.two_sheet_crossing_flag) {
+        Matrix3d Q = QP[region_id].quadraticMatrix();
+        SelfAdjointEigenSolver<Matrix3d> eig(Q);
+        if (eig.info() == Success) {
+            Vector3d evals = eig.eigenvalues();
+            double max_abs = max({abs(evals(0)), abs(evals(1)), abs(evals(2))});
+            if (max_abs > 1e-15) {
+                double tol = 1e-6 * max_abs;
+
+                int n_pos = 0, n_neg = 0;
+                for (int i = 0; i < 3; i++) {
+                    if (evals(i) >= tol) n_pos++;
+                    else if (evals(i) <= -tol) n_neg++;
+                }
+
+                int minority_idx = -1;
+                if (n_pos == 1) {
+                    for (int i = 0; i < 3; i++)
+                        if (evals(i) >= tol) { minority_idx = i; break; }
+                } else if (n_neg == 1) {
+                    for (int i = 0; i < 3; i++)
+                        if (evals(i) <= -tol) { minority_idx = i; break; }
+                }
+
+                if (minority_idx >= 0) {
+                    Vector3d b(QP[region_id].coeffs(1), QP[region_id].coeffs(2), QP[region_id].coeffs(3));
+                    bool invertible = false;
+                    Matrix3d Q_inv;
+                    Q.computeInverseWithCheck(Q_inv, invertible);
+                    if (invertible) {
+                        Vector3d center = -0.5 * Q_inv * b;
+                        Matrix3d E = eig.eigenvectors();
+
+                        vector<int> side_pos, side_neg;
+                        for (int fi : region_faces) {
+                            Vector3i f = F.row(fi);
+                            Vector3d centroid = (v3(V.row(f(0))) + v3(V.row(f(1))) + v3(V.row(f(2)))) / 3.0;
+                            Vector3d canonical = E.transpose() * (centroid - center);
+                            if (canonical(minority_idx) > 0) side_pos.push_back(fi);
+                            else side_neg.push_back(fi);
+                        }
+
+                        auto& chosen = (side_pos.size() <= side_neg.size()) ? side_pos : side_neg;
+                        int best_face = -1;
+                        double best_err = -1;
+                        for (int fi : chosen) {
+                            double e = qerr(fi);
+                            if (e > best_err) { best_err = e; best_face = fi; }
+                        }
+                        if (best_face >= 0) return best_face;
+                    }
+                }
+            }
+        }
+    }
+
+    // C. Fallback: max-error face in region
+    int best_face = -1;
+    double best_err = -1;
+    for (int fi : region_faces) {
+        double e = qerr(fi);
+        if (e > best_err) { best_err = e; best_face = fi; }
+    }
+    return best_face;
 }

@@ -13,8 +13,11 @@
 #include "triangulation.h"
 #include "renumbering.h"
 #include "vsa_batch.h"
+#include "feature_barrier.h"
 #include <ctime>
 #include <string>
+#include <map>
+#include <set>
 
 using namespace Eigen; // to use the classes provided by Eigen library
 using namespace std;
@@ -53,6 +56,24 @@ bool has_face_error_values = false;
 // ---- Quadric mode state ----
 vector<QuadricProxy> QP;
 bool use_quadric = false;
+
+// ---- Feature barrier state ----
+double g_feature_angle_threshold = 30.0;  // degrees
+
+// ---- Region boundary structures ----
+enum BoundaryType { BT_REGION, BT_MESH, BT_NONMANIFOLD };
+
+struct BoundaryEdge {
+    EdgeKey ek;
+    BoundaryType type;
+    int region_i, region_j;
+    int face_i, face_j;
+};
+
+static vector<BoundaryEdge> g_boundary_edges;
+static bool g_boundary_valid = false;
+static vector<pair<int,int>> g_region_pairs;
+static int g_current_pair_idx = 0;
 
 // ---- Deterministic region color (same label = same color) ----
 static Eigen::RowVector3d region_color_det(int label) {
@@ -164,6 +185,168 @@ static inline Vector3d v3(const Eigen::RowVectorXd& r) {
   return Vector3d(r(0), r(1), r(2));
 }
 
+// ---- Build edge → incident faces mapping ----
+static map<EdgeKey, vector<int>> build_edge_to_faces() {
+    map<EdgeKey, vector<int>> e2f;
+    for (int fi = 0; fi < F.rows(); fi++) {
+        for (int j = 0; j < 3; j++) {
+            int va = F(fi, j), vb = F(fi, (j+1)%3);
+            EdgeKey ek(va, vb);
+            e2f[ek].push_back(fi);
+        }
+    }
+    return e2f;
+}
+
+// ---- Extract all boundary edges from current R ----
+static void extract_region_boundaries() {
+    auto e2f = build_edge_to_faces();
+    g_boundary_edges.clear();
+    g_region_pairs.clear();
+    set<pair<int,int>> pair_set;
+
+    for (auto& kv : e2f) {
+        auto& ek = kv.first;
+        auto& faces = kv.second;
+        BoundaryEdge be;
+        be.ek = ek;
+        be.face_i = faces.size() > 0 ? faces[0] : -1;
+        be.face_j = faces.size() > 1 ? faces[1] : -1;
+
+        if (faces.size() == 1) {
+            be.type = BT_MESH;
+            be.region_i = R(faces[0], 0);
+            be.region_j = -1;
+            g_boundary_edges.push_back(be);
+        } else if (faces.size() == 2) {
+            int r0 = R(faces[0], 0);
+            int r1 = R(faces[1], 0);
+            be.region_i = r0;
+            be.region_j = r1;
+            if (r0 != r1) {
+                be.type = BT_REGION;
+                g_boundary_edges.push_back(be);
+                pair_set.insert(make_pair(min(r0, r1), max(r0, r1)));
+            }
+        } else {
+            be.type = BT_NONMANIFOLD;
+            be.region_i = -1;
+            be.region_j = -1;
+            g_boundary_edges.push_back(be);
+        }
+    }
+
+    g_region_pairs.assign(pair_set.begin(), pair_set.end());
+    sort(g_region_pairs.begin(), g_region_pairs.end());
+    g_boundary_valid = true;
+
+    int rc = 0, mc = 0, nc = 0;
+    for (auto& be : g_boundary_edges) {
+        if (be.type == BT_REGION) rc++;
+        else if (be.type == BT_MESH) mc++;
+        else nc++;
+    }
+    cout << "[boundary] " << g_boundary_edges.size() << " boundary edges: "
+         << rc << " region, " << mc << " mesh, " << nc << " nonmanifold" << endl;
+    cout << "  Region pairs: " << g_region_pairs.size() << endl;
+}
+
+// ---- Show all region boundaries (G key) ----
+static void show_region_boundaries(igl::opengl::glfw::Viewer& viewer) {
+    if (!g_boundary_valid) extract_region_boundaries();
+
+    viewer.data().clear();
+    viewer.data().set_mesh(V, F);
+    MatrixXd colors = make_face_colors_from_labels(R, F.rows());
+    viewer.data().set_colors(colors);
+    viewer.data().show_lines = false;
+
+    int n = g_boundary_edges.size();
+    if (n == 0) {
+        cout << "[boundary] No boundary edges found." << endl;
+        return;
+    }
+
+    MatrixXd P1(n, 3), P2(n, 3), EC(n, 3);
+    for (int i = 0; i < n; i++) {
+        auto& be = g_boundary_edges[i];
+        P1.row(i) = V.row(be.ek.v0);
+        P2.row(i) = V.row(be.ek.v1);
+        if (be.type == BT_REGION)
+            EC.row(i) = RowVector3d(1.0, 0.0, 0.0);
+        else if (be.type == BT_MESH)
+            EC.row(i) = RowVector3d(0.0, 0.4, 1.0);
+        else
+            EC.row(i) = RowVector3d(1.0, 1.0, 0.0);
+    }
+    viewer.data().add_edges(P1, P2, EC);
+    viewer.data().show_overlay = true;
+    viewer.data().line_width = 2.0;
+
+    int rc = 0, mc = 0;
+    for (auto& be : g_boundary_edges) {
+        if (be.type == BT_REGION) rc++;
+        else if (be.type == BT_MESH) mc++;
+    }
+    cout << "[boundary] Drawn: " << rc << " region (red) + " << mc
+         << " mesh (blue) edges (total " << n << ")" << endl;
+}
+
+// ---- Show one region pair boundary (H/J/K keys) ----
+static void show_one_region_pair_boundary(igl::opengl::glfw::Viewer& viewer, int pair_idx) {
+    if (!g_boundary_valid) extract_region_boundaries();
+    if (g_region_pairs.empty()) {
+        cout << "No region pairs found." << endl;
+        return;
+    }
+    pair_idx = max(0, min(pair_idx, (int)g_region_pairs.size() - 1));
+    g_current_pair_idx = pair_idx;
+
+    int ri = g_region_pairs[pair_idx].first;
+    int rj = g_region_pairs[pair_idx].second;
+
+    viewer.data().clear();
+    viewer.data().set_mesh(V, F);
+    MatrixXd colors(F.rows(), 3);
+    for (int i = 0; i < F.rows(); i++) {
+        int r = R(i, 0);
+        if (r == ri)
+            colors.row(i) = Eigen::RowVector3d(0.2, 0.6, 1.0);
+        else if (r == rj)
+            colors.row(i) = Eigen::RowVector3d(1.0, 0.6, 0.2);
+        else
+            colors.row(i) = Eigen::RowVector3d(0.85, 0.85, 0.85);
+    }
+    viewer.data().set_colors(colors);
+    viewer.data().show_lines = false;
+
+    // Collect edges for this pair
+    vector<int> pair_edge_idx;
+    for (int i = 0; i < (int)g_boundary_edges.size(); i++) {
+        auto& be = g_boundary_edges[i];
+        if (be.type != BT_REGION) continue;
+        int a = min(be.region_i, be.region_j);
+        int b = max(be.region_i, be.region_j);
+        if (a == ri && b == rj) pair_edge_idx.push_back(i);
+    }
+
+    if (!pair_edge_idx.empty()) {
+        MatrixXd P1(pair_edge_idx.size(), 3), P2(pair_edge_idx.size(), 3), EC(pair_edge_idx.size(), 3);
+        for (int k = 0; k < (int)pair_edge_idx.size(); k++) {
+            auto& be = g_boundary_edges[pair_edge_idx[k]];
+            P1.row(k) = V.row(be.ek.v0);
+            P2.row(k) = V.row(be.ek.v1);
+            EC.row(k) = RowVector3d(1.0, 0.0, 0.0);
+        }
+        viewer.data().add_edges(P1, P2, EC);
+        viewer.data().show_overlay = true;
+        viewer.data().line_width = 2.0;
+    }
+
+    cout << "[pair " << (pair_idx+1) << "/" << g_region_pairs.size() << "] "
+         << "Region " << ri << " <-> " << rj << ": " << pair_edge_idx.size() << " edges" << endl;
+}
+
 // ---- Quadric Lloyd: one step (no viewer update) ----
 static void quadric_lloyd_step() {
   int m = F.rows();
@@ -186,6 +369,7 @@ static void quadric_lloyd_step() {
     if (seeds[i] < 0) continue;
     R_new(seeds[i], 0) = i;
     for (int k = 0; k < 3; k++) {
+      if (is_feature_barrier(seeds[i], k, F, Ad)) continue;
       int nb = Ad(seeds[i], k);
       if (nb < 0) continue;
       Vector3i f = F.row(nb);
@@ -200,6 +384,7 @@ static void quadric_lloyd_step() {
     if (R_new(face, 0) != -1) continue;
     R_new(face, 0) = prox;
     for (int k = 0; k < 3; k++) {
+      if (is_feature_barrier(face, k, F, Ad)) continue;
       int nb = Ad(face, k);
       if (nb < 0 || R_new(nb, 0) != -1) continue;
       Vector3i f = F.row(nb);
@@ -207,6 +392,19 @@ static void quadric_lloyd_step() {
       q.push(make_pair(-d, nb + m * prox));
     }
   }
+
+  // Assign any remaining -1 faces to a neighbor's proxy
+  for (int i = 0; i < m; i++) {
+    if (R_new(i, 0) >= 0) continue;
+    for (int k = 0; k < 3; k++) {
+      int nb = Ad(i, k);
+      if (nb >= 0 && R_new(nb, 0) >= 0) {
+        R_new(i, 0) = R_new(nb, 0);
+        break;
+      }
+    }
+  }
+
   R = R_new;
 
   // Refit quadric proxies
@@ -574,11 +772,19 @@ bool key_down(igl::opengl::glfw::Viewer &viewer, unsigned char key, int modifier
     show_segmentation(viewer, V, F, R, "K=" + to_string(p));
     return true;
   }
-  // N: Progressive auto-insert until error threshold
-  if (key == 'N' || (unsigned int)key == 78) {
+  // N: Progressive auto-insert until error threshold (validity-guided in quadric mode)
+  if (key == 'N' || key == 'n') {
     double err_thresh = 2e-5;
-    int max_p = min((int)F.rows() / 3, 200);
+    int max_p = min((int)F.rows() / 3, 30);
+    int max_validity_attempts = 20;
+    int consecutive_validity_splits = 0;
+    int prev_invalid_count = 0;
     cout << "Progressive insertion: threshold=" << err_thresh << " max_K=" << max_p << endl;
+    // Feature barrier: compute edges if enabled but not yet computed
+    if (g_feature_barrier_enabled && g_feature_edges.empty()) {
+      compute_feature_edges(F, Ad, g_feature_angle_threshold);
+      cout << "Feature barrier active: " << g_feature_edges.size() << " edges" << endl;
+    }
     for (;;) {
       // Lloyd converge (up to 30 iters)
       if (use_quadric) {
@@ -599,7 +805,7 @@ bool key_down(igl::opengl::glfw::Viewer &viewer, unsigned char key, int modifier
           if (ch == 0) break;
         }
       }
-      // Check max region error
+      // Compute max region error
       vector<double> re(p,0), ra(p,0);
       for (int i = 0; i < F.rows(); i++) {
         int j = R(i,0);
@@ -618,47 +824,231 @@ bool key_down(igl::opengl::glfw::Viewer &viewer, unsigned char key, int modifier
         double ne = ra[j]>1e-15 ? re[j]/ra[j] : 0;
         if (ne > max_ne) max_ne = ne;
       }
-      cout << "  K=" << p << " max_region_err=" << max_ne << endl;
-      if (max_ne < err_thresh || p >= max_p) {
-        cout << "  Stopped: " << (max_ne < err_thresh ? "threshold met" : "max proxies reached") << endl;
+      // Validity check (quadric mode only)
+      int invalid_count = 0;
+      vector<ProxyValidityReport> reports;
+      if (use_quadric) {
+        ProxyValidityConfig full_cfg;
+        full_cfg.enable_basic = true;
+        full_cfg.enable_degeneracy = true;
+        full_cfg.enable_classification = true;
+        full_cfg.enable_two_sheet = true;
+        reports = check_all_proxies(QP, R, F, V, full_cfg);
+        for (auto& rpt : reports)
+          if (!rpt.is_valid || rpt.is_suspicious) invalid_count++;
+      }
+      cout << "  K=" << p << " max_region_err=" << max_ne
+           << " invalid=" << invalid_count << endl;
+      // Stop conditions
+      if (p >= max_p) {
+        cout << "  Stopped: max proxies reached" << endl;
         break;
       }
-      // Insert one proxy (same logic as 'I')
-      int worst = 0; double wne = 0;
-      for (int j = 0; j < p; j++) {
-        double ne = ra[j]>1e-15 ? re[j]/ra[j] : 0;
-        if (ne>wne) { wne=ne; worst=j; }
+      if (max_ne < err_thresh && invalid_count == 0) {
+        cout << "  Stopped: threshold met, no invalid proxies" << endl;
+        break;
       }
-      int wf2 = -1; double wf2e = -1;
-      for (int i = 0; i < F.rows(); i++) {
-        if (R(i,0)!=worst) continue;
-        double e; Vector3i f = F.row(i);
-        if (use_quadric && worst<(int)QP.size())
-          e = QP[worst].triangle_error(v3(V.row(f(0))),v3(V.row(f(1))),v3(V.row(f(2))));
-        else
-          e = distance(i, Proxies.row(worst), Proxies.row(p+worst), V, metric);
-        if (e>wf2e) { wf2e=e; wf2=i; }
+      // Choose region to split
+      int split_region = -1, seed_face = -1;
+      string split_mode = "max_error";
+      if (use_quadric && invalid_count > 0 &&
+          consecutive_validity_splits < max_validity_attempts) {
+        int rid = choose_region_to_split_by_validity(reports, 4);
+        if (rid >= 0) {
+          seed_face = choose_seed_face_for_invalid_region(rid, reports[rid], R, F, V, QP);
+          if (seed_face >= 0) {
+            split_region = rid;
+            split_mode = (!reports[rid].is_valid) ? "invalid_proxy" : "suspicious_proxy";
+          }
+        }
       }
-      if (wf2 < 0) break;
+      if (split_region < 0) {
+        // Fallback: max-error region
+        int worst = 0; double wne = 0;
+        for (int j = 0; j < p; j++) {
+          double ne = ra[j]>1e-15 ? re[j]/ra[j] : 0;
+          if (ne>wne) { wne=ne; worst=j; }
+        }
+        split_region = worst;
+        seed_face = -1; double wf2e = -1;
+        for (int i = 0; i < F.rows(); i++) {
+          if (R(i,0)!=split_region) continue;
+          double e; Vector3i f = F.row(i);
+          if (use_quadric && split_region<(int)QP.size())
+            e = QP[split_region].triangle_error(v3(V.row(f(0))),v3(V.row(f(1))),v3(V.row(f(2))));
+          else
+            e = distance(i, Proxies.row(split_region), Proxies.row(p+split_region), V, metric);
+          if (e>wf2e) { wf2e=e; seed_face=i; }
+        }
+        split_mode = "max_error";
+      }
+      if (seed_face < 0) break;
+      cout << "    split: " << split_mode << " region=" << split_region
+           << " seed=" << seed_face << endl;
+      // Track consecutive validity splits
+      if (split_mode != "max_error") {
+        if (invalid_count >= prev_invalid_count) consecutive_validity_splits++;
+        else consecutive_validity_splits = 0;
+      } else {
+        consecutive_validity_splits = 0;
+      }
+      prev_invalid_count = invalid_count;
+      // Insert proxy
       int op = p; p++;
-      R(wf2,0) = op;
+      R(seed_face,0) = op;
       if (use_quadric) {
         QP.resize(p);
         QP[op] = fit_quadric_region(R, op, F, V);
-        QP[worst] = fit_quadric_region(R, worst, F, V);
+        QP[split_region] = fit_quadric_region(R, split_region, F, V);
       } else {
         MatrixXd nP(p*2,3); nP.setZero();
         for (int j=0;j<op;j++) { nP.row(j)=Proxies.row(j); nP.row(p+j)=Proxies.row(op+j); }
-        Vector3d c=(v3(V.row(F(wf2,0)))+v3(V.row(F(wf2,1)))+v3(V.row(F(wf2,2))))/3.0;
-        Vector3d n=(v3(V.row(F(wf2,1)))-v3(V.row(F(wf2,0)))).cross(v3(V.row(F(wf2,2)))-v3(V.row(F(wf2,0))));
+        Vector3d c=(v3(V.row(F(seed_face,0)))+v3(V.row(F(seed_face,1)))+v3(V.row(F(seed_face,2))))/3.0;
+        Vector3d n=(v3(V.row(F(seed_face,1)))-v3(V.row(F(seed_face,0)))).cross(v3(V.row(F(seed_face,2)))-v3(V.row(F(seed_face,0))));
         if (n.norm()>1e-12) n.normalize();
         nP.row(op)=c; nP.row(p+op)=n;
         Proxies = nP;
       }
     }
     iterations++;
-    show_segmentation(viewer, V, F, R, "Progressive K=" + to_string(p));
-    cout << "  Done. Final K=" << p << endl;
+    int K_after_progressive = p;
+
+    // === Phase 2: Merge ===
+    int merge_count = 0;
+    int K_after_merge = p;
+    bool pipeline_enable_merge = true;
+    double merge_rel_thresh = 0.05;
+    int max_merge_iters = 50;
+
+    if (pipeline_enable_merge && p >= 2) {
+      cout << "\n=== Merge phase ===" << endl;
+      ProxyType pt = use_quadric ? QUADRIC_PROXY : PLANE_PROXY;
+      merge_count = run_merge_pass(R, QP, Proxies, p, pt, metric,
+                                    F, V, Ad, merge_rel_thresh, max_merge_iters);
+      K_after_merge = p;
+      cout << "  Merged " << merge_count << " pairs. K: "
+           << K_after_progressive << " -> " << p << endl;
+
+      // Refit all proxies
+      if (use_quadric) {
+        QP.resize(p);
+        for (int j = 0; j < p; j++)
+          QP[j] = fit_quadric_region(R, j, F, V);
+      } else {
+        Proxies = new_proxies(R, F, V, p, metric);
+      }
+    }
+
+    // === Phase 3: Final boundary smoothing ===
+    int smoothing_changed = 0;
+    bool pipeline_enable_smoothing = true;
+
+    if (pipeline_enable_smoothing) {
+      cout << "\n=== Final boundary smoothing ===" << endl;
+      R_before_smoothing = R;
+      has_before_smoothing = true;
+
+      SmoothConfig sc;
+      vector<SmoothLogEntry> slog;
+      ProxyType pt = use_quadric ? QUADRIC_PROXY : PLANE_PROXY;
+      smooth_boundaries(R, F, V, Ad, p, pt, QP, Proxies, metric, sc, slog);
+
+      R_after_smoothing = R;
+      has_after_smoothing = true;
+
+      for (int i = 0; i < F.rows(); i++)
+        if (R_before_smoothing(i,0) != R_after_smoothing(i,0)) smoothing_changed++;
+      cout << "  Changed " << smoothing_changed << " faces." << endl;
+
+      // Refit all proxies after smoothing
+      if (use_quadric) {
+        for (int j = 0; j < p; j++)
+          QP[j] = fit_quadric_region(R, j, F, V);
+      } else {
+        Proxies = new_proxies(R, F, V, p, metric);
+      }
+    }
+
+    // === Compute final max_region_error ===
+    {
+      vector<double> fre(p,0), fra(p,0);
+      for (int i = 0; i < F.rows(); i++) {
+        int j = R(i,0);
+        if (j<0||j>=p) continue;
+        Vector3i f = F.row(i);
+        double a = 0.5*(v3(V.row(f(1)))-v3(V.row(f(0)))).cross(v3(V.row(f(2)))-v3(V.row(f(0)))).norm();
+        double e;
+        if (use_quadric && j<(int)QP.size())
+          e = QP[j].triangle_error(v3(V.row(f(0))),v3(V.row(f(1))),v3(V.row(f(2))));
+        else
+          e = distance(i, Proxies.row(j), Proxies.row(p+j), V, metric);
+        fre[j] += e; fra[j] += a;
+      }
+      double final_max_ne = 0;
+      for (int j = 0; j < p; j++) {
+        double ne = fra[j]>1e-15 ? fre[j]/fra[j] : 0;
+        if (ne > final_max_ne) final_max_ne = ne;
+      }
+      // Count invalid (if quadric)
+      int final_invalid = 0;
+      if (use_quadric) {
+        ProxyValidityConfig full_cfg;
+        full_cfg.enable_basic = true;
+        full_cfg.enable_degeneracy = true;
+        full_cfg.enable_classification = true;
+        full_cfg.enable_two_sheet = true;
+        auto reports = check_all_proxies(QP, R, F, V, full_cfg);
+        for (auto& rpt : reports)
+          if (!rpt.is_valid || rpt.is_suspicious) final_invalid++;
+      }
+
+      // === Pipeline Summary ===
+      cout << "\n[Pipeline Summary]" << endl;
+      cout << "  K_after_progressive  = " << K_after_progressive << endl;
+      cout << "  K_after_merge        = " << K_after_merge << endl;
+      cout << "  final_K              = " << p << endl;
+      cout << "  merge_enabled        = " << (pipeline_enable_merge ? "true" : "false") << endl;
+      cout << "  merge_count          = " << merge_count << endl;
+      cout << "  boundary_smoothing   = " << (pipeline_enable_smoothing ? "true" : "false") << endl;
+      cout << "  smoothing_changed    = " << smoothing_changed << endl;
+      cout << "  final_max_region_err = " << final_max_ne << endl;
+      if (use_quadric)
+        cout << "  final_invalid        = " << final_invalid << endl;
+    }
+
+    show_segmentation(viewer, V, F, R, "Pipeline K=" + to_string(p));
+    return true;
+  }
+  // F: Feature edge barrier toggle
+  if (key == 'F' || key == 'f') {
+    if (g_feature_edges.empty()) {
+      // First press: compute feature edges
+      compute_feature_edges(F, Ad, g_feature_angle_threshold);
+      g_feature_barrier_enabled = true;
+      cout << "Feature barrier ENABLED (" << g_feature_edges.size() << " edges, threshold="
+           << g_feature_angle_threshold << " deg)" << endl;
+    } else if (g_feature_barrier_enabled) {
+      g_feature_barrier_enabled = false;
+      cout << "Feature barrier DISABLED (edges kept, " << g_feature_edges.size() << " edges)" << endl;
+    } else {
+      g_feature_barrier_enabled = true;
+      cout << "Feature barrier RE-ENABLED (" << g_feature_edges.size() << " edges)" << endl;
+    }
+    // Show/hide feature edges
+    if (g_feature_barrier_enabled && !g_feature_edges.empty()) {
+      MatrixXd P1, P2;
+      get_feature_edge_points(F, V, g_feature_edges, P1, P2);
+      viewer.data().add_edges(P1, P2, RowVector3d(1, 0, 0));
+      viewer.data().show_lines = false;
+      viewer.data().show_overlay = true;
+      viewer.data().line_width = 2.0;
+      cout << "Feature edges shown in red" << endl;
+    } else {
+      // Clear overlay to hide feature edges
+      viewer.data().clear_edges();
+      viewer.data().show_lines = true;
+      cout << "Feature edges hidden" << endl;
+    }
     return true;
   }
   // Q: Toggle quadric/plane mode
@@ -798,6 +1188,18 @@ bool key_down(igl::opengl::glfw::Viewer &viewer, unsigned char key, int modifier
       // ========== END DIAGNOSTICS ==========
 
     } else {
+      // Safety: check R for invalid labels before calling new_proxies
+      {
+        int bad = 0;
+        for (int i = 0; i < R.rows(); i++) {
+          if (R(i,0) < 0 || R(i,0) >= p) {
+            if (bad == 0) cout << "WARNING: invalid labels in R before new_proxies:" << endl;
+            if (bad < 5) cout << "  R(" << i << ")=" << R(i,0) << " (p=" << p << ")" << endl;
+            bad++;
+          }
+        }
+        if (bad > 0) cout << "  total " << bad << " invalid labels" << endl;
+      }
       Proxies = new_proxies(R, F, V, p, metric);
       cout << "Switched to PLANE mode. Fitted " << p << " plane proxies." << endl;
     }
@@ -847,6 +1249,39 @@ bool key_down(igl::opengl::glfw::Viewer &viewer, unsigned char key, int modifier
     cout << "  Projected: success=" << plog.success_count
          << " fallback=" << plog.fallback_count
          << " failure=" << plog.failure_count << endl;
+    return true;
+  }
+  // G/g: Show all region boundaries
+  if (key == 'G' || key == 'g') {
+    g_boundary_valid = false;  // force re-extract
+    show_region_boundaries(viewer);
+    return true;
+  }
+  // H/h: Show current region pair boundary
+  if (key == 'H' || key == 'h') {
+    show_one_region_pair_boundary(viewer, g_current_pair_idx);
+    return true;
+  }
+  // J/j: Next region pair
+  if (key == 'J' || key == 'j') {
+    if (!g_boundary_valid) extract_region_boundaries();
+    if (g_region_pairs.empty()) {
+      cout << "No region pairs. Press G first to extract boundaries." << endl;
+      return true;
+    }
+    g_current_pair_idx = (g_current_pair_idx + 1) % g_region_pairs.size();
+    show_one_region_pair_boundary(viewer, g_current_pair_idx);
+    return true;
+  }
+  // K/k: Previous region pair
+  if (key == 'K' || key == 'k') {
+    if (!g_boundary_valid) extract_region_boundaries();
+    if (g_region_pairs.empty()) {
+      cout << "No region pairs. Press G first to extract boundaries." << endl;
+      return true;
+    }
+    g_current_pair_idx = (g_current_pair_idx - 1 + g_region_pairs.size()) % g_region_pairs.size();
+    show_one_region_pair_boundary(viewer, g_current_pair_idx);
     return true;
   }
   if (key == 'S' || (unsigned int)key == 83){
@@ -950,6 +1385,20 @@ int main(int argc, char *argv[])
     bool enable_projection = has_arg(argc, argv, "--project-output");
     ProjectionConfig proj_cfg;
 
+    // Validity-guided insertion config
+    bool validity_guided = has_arg(argc, argv, "--validity-guided-insertion");
+    if (validity_guided) {
+      validity_cfg.enable_basic = true;
+      validity_cfg.enable_degeneracy = true;
+      validity_cfg.enable_classification = true;
+      validity_cfg.enable_two_sheet = true;
+    }
+    int max_validity_split_attempts = stoi(
+        get_arg(argc, argv, "--max-validity-split-attempts", "20"));
+    int min_faces_to_split = stoi(
+        get_arg(argc, argv, "--min-faces-to-split", "4"));
+    bool export_validity_each_step = has_arg(argc, argv, "--export-validity-each-step");
+
     cout << "=== Progressive VSA ===" << endl;
     cout << "  model:           " << model << endl;
     cout << "  proxy_type:      " << (ptype == QUADRIC_PROXY ? "quadric" : "plane") << endl;
@@ -958,8 +1407,13 @@ int main(int argc, char *argv[])
     cout << "  error_threshold: " << err_thresh << endl;
     cout << "  lloyd_iter:      " << lloyd_iter << endl;
     cout << "  seed:            " << seed << endl;
-    if (check_validity || classify_proxies) {
-      cout << "  validity_check:  " << (check_validity ? "basic (Layer 1)" : "off") << endl;
+    if (check_validity) {
+      cout << "  validity_check:  basic (Layer 1)" << endl;
+    }
+    if (validity_guided) {
+      cout << "  validity_guided: enabled (all 4 layers)" << endl;
+      cout << "  max_validity_split_attempts: " << max_validity_split_attempts << endl;
+      cout << "  min_faces_to_split: " << min_faces_to_split << endl;
     }
     if (classify_proxies) {
       cout << "  classify:        enabled (eps=" << classify_eps << ")" << endl;
@@ -974,6 +1428,9 @@ int main(int argc, char *argv[])
     if (enable_projection) {
       cout << "  projection:      enabled" << endl;
     }
+    if (export_validity_each_step) {
+      cout << "  export_validity_each_step: enabled" << endl;
+    }
 
     MatrixXi R_out;
     vector<IterationStats> stats;
@@ -985,7 +1442,9 @@ int main(int argc, char *argv[])
                         merge_log, smooth_log, enable_merge,
                         enable_smooth, smooth_cfg, validity_cfg,
                         classify_proxies, classify_eps,
-                        enable_projection, proj_cfg);
+                        enable_projection, proj_cfg,
+                        validity_guided, max_validity_split_attempts,
+                        min_faces_to_split, export_validity_each_step);
     return 0;
   }
 
