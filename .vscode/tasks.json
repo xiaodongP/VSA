@@ -8,6 +8,7 @@
             "args": [
                 "-C",
                 "${workspaceFolder}/build",
+                "variational_bin",
                 "-j"
             ],
             "options": {
@@ -20,6 +21,21 @@
             "problemMatcher": [
                 "$gcc"
             ]
+        },
+        {
+            "label": "Run VSA (no debugger)",
+            "type": "shell",
+            "command": "${workspaceFolder}/build/variational_bin.exe",
+            "args": [
+                "fandisk",
+                "3",
+                "0.3"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "Build",
+            "problemMatcher": []
         },
         {
             "type": "cppbuild",

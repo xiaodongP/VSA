@@ -1,1 +1,50 @@
 /build
+/build_polyscope/
+
+# Tool-local build trees and fetched dependencies
+tools/**/build/
+tools/**/.cache/
+
+# Local third-party archives/extractions
+/external/
+
+# Viewer/local UI state
+imgui.ini
+.polyscope.ini
+
+# Generated mesh/debug artifacts
+*.obj
+*.ply
+*.off
+*.coff
+*.qvsa
+*.csv
+*_log.txt
+*_report.txt
+*_status.txt
+*_metadata.txt
+*_boundary_loop.txt
+*_proxies.json
+*_failed_regions.txt
+
+# Generated JSON reports / run outputs
+trimmed_bspline_output*/
+trimmed_snapshot_regression_region_*/
+bezier_frame_debug_*/
+labeling_debug_*/
+paper_extract/
+
+# Common generated debug prefixes
+*_debug*/
+*_control_net.*
+*_control_points.*
+*_sampled_surface.*
+*_heatmap.*
+*_triangulation.*
+*_trim_loop.*
+*_trim_control_polygon.*
+*_surface.obj
+*_mesh.obj
+*_boundary.obj
+*_boundaries.obj
+*_correspondence.obj

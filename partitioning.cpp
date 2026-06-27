@@ -2,16 +2,64 @@
 #include "distance.h"
 #include "proxies.h"
 #include "feature_barrier.h"
+#include <algorithm>
+#include <functional>
 #include <limits>
+#include <set>
+#include <vector>
 
 //******************Partitionning******************
+
+static int fill_unassigned_faces_respecting_features(MatrixXi& R,
+                                                     const MatrixXi& F,
+                                                     const MatrixXi& Ad) {
+  int m = R.rows();
+  int assigned = 0;
+  bool changed = true;
+
+  while (changed) {
+    changed = false;
+    for (int i = 0; i < m; i++) {
+      if (R(i) >= 0) continue;
+      for (int k = 0; k < 3; k++) {
+        int nb = Ad(i, k);
+        if (nb < 0 || nb >= m || R(nb) < 0) continue;
+        if (is_feature_barrier(i, k, F, Ad)) continue;
+        R(i) = R(nb);
+        assigned++;
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  int crossed_feature_fallbacks = 0;
+  for (int i = 0; i < m; i++) {
+    if (R(i) >= 0) continue;
+    for (int k = 0; k < 3; k++) {
+      int nb = Ad(i, k);
+      if (nb >= 0 && nb < m && R(nb) >= 0) {
+        R(i) = R(nb);
+        assigned++;
+        crossed_feature_fallbacks++;
+        break;
+      }
+    }
+  }
+
+  if (crossed_feature_fallbacks > 0) {
+    cout << "[feature_barrier warning] assigned " << crossed_feature_fallbacks
+         << " faces across feature edges because their feature component had no seed." << endl;
+  }
+  return assigned;
+}
 
 MatrixXi face_adjacency(MatrixXi F, int n) { // n: number of vertices
   // face adjacency matrix, O(m log(m)) performances
  
   int m = F.rows();
   MatrixXi Ad;
-  Ad.setZero(m,3);
+  Ad.setConstant(m, 3, -1);
   map<int,int> edge;
   
   for (int i=0;i<m;i++) {
@@ -77,9 +125,10 @@ void fcolor(MatrixXd &Cf, MatrixXi Ad) {
     if (Cf(face.second,0)==0) {
       Cf(face.second,0) = face.first;
       color = face.first * 0.95;
-      q.push(make_pair(color,Ad(face.second,0)));
-      q.push(make_pair(color,Ad(face.second,1)));
-      q.push(make_pair(color,Ad(face.second,2)));
+      for (int k = 0; k < 3; k++) {
+        int nb = Ad(face.second, k);
+        if (nb >= 0 && nb < Ad.rows()) q.push(make_pair(color, nb));
+      }
     }
   }
   
@@ -121,6 +170,7 @@ int find_triangles_region(vector<int> Triangles, MatrixXi &R, MatrixXd V, Matrix
     for (int k=0;k<3;k++) {
         if (is_feature_barrier(Triangles[i], k, F, Ad)) continue;
         int tri = Ad(Triangles[i],k);
+        if (tri < 0 || tri >= m) continue;
         double d = distance(tri, Proxies_center[i], Proxies_normal[i], V, metric);
         q.push(make_pair(-d, tri+m*(i)));
         if (d>furthest_distance(i) && !vector_contains(Triangles,tri)) {
@@ -148,6 +198,7 @@ int find_triangles_region(vector<int> Triangles, MatrixXi &R, MatrixXd V, Matrix
       for (int k=0;k<3;k++) {
         if (is_feature_barrier(face, k, F, Ad)) continue;
         int tri = Ad(face,k);
+        if (tri < 0 || tri >= m) continue;
         double d = distance(tri, Proxies_center[prox], Proxies_normal[prox], V, metric);
         q.push(make_pair(-d, tri+m*prox));
         if (d>furthest_distance(prox) && !vector_contains(Triangles,tri)) {
@@ -158,17 +209,7 @@ int find_triangles_region(vector<int> Triangles, MatrixXi &R, MatrixXd V, Matrix
     }
   }
 
-  // Assign any remaining -1 faces to a neighbor's region
-  for (int i=0; i<m; i++) {
-    if (R(i) >= 0) continue;
-    for (int k=0; k<3; k++) {
-      int nb = Ad(i,k);
-      if (nb >= 0 && R(nb) >= 0) {
-        R(i) = R(nb);
-        break;
-      }
-    }
-  }
+  fill_unassigned_faces_respecting_features(R, F, Ad);
 
   double max=furthest_distance(0);
   int maxtri=furthest_triangle(0);
@@ -182,7 +223,41 @@ int find_triangles_region(vector<int> Triangles, MatrixXi &R, MatrixXd V, Matrix
 }
 
 void initial_partition(int p, MatrixXi &R, MatrixXd V, MatrixXi F, MatrixXi Ad, MetricMode metric) {
-  vector<int> Triangles = random_proxies(p,F.rows());
+  vector<int> Triangles;
+  if (g_feature_barrier_enabled && !g_feature_edges.empty()) {
+    VectorXi groups = build_feature_groups(F, Ad, g_feature_edges);
+    map<int, vector<int>> group_faces;
+    for (int fi = 0; fi < groups.rows(); fi++) {
+      if (groups(fi) >= 0) group_faces[groups(fi)].push_back(fi);
+    }
+
+    vector<pair<int, int>> group_sizes;
+    for (const auto& kv : group_faces) {
+      group_sizes.push_back(make_pair((int)kv.second.size(), kv.first));
+    }
+    sort(group_sizes.begin(), group_sizes.end(), greater<pair<int, int>>());
+
+    set<int> used;
+    for (const auto& entry : group_sizes) {
+      if ((int)Triangles.size() >= p) break;
+      const vector<int>& faces = group_faces[entry.second];
+      if (faces.empty()) continue;
+      int seed = faces[rand() % faces.size()];
+      Triangles.push_back(seed);
+      used.insert(seed);
+    }
+
+    while ((int)Triangles.size() < p) {
+      int seed = rand() % F.rows();
+      if (used.insert(seed).second) Triangles.push_back(seed);
+    }
+
+    cout << "[feature_barrier] initial seeds cover "
+         << min((int)group_sizes.size(), p) << " / " << group_sizes.size()
+         << " feature groups" << endl;
+  } else {
+    Triangles = random_proxies(p,F.rows());
+  }
   find_triangles_region(Triangles,R,V,F,Ad,metric);
 }
 
@@ -241,6 +316,7 @@ void proxy_color(MatrixXi &R, MatrixXd Proxies, MatrixXd V, MatrixXi F, MatrixXi
     for (int k=0;k<3;k++) {
         if (is_feature_barrier(triangles(i), k, F, Ad)) continue;
         int tri = Ad(triangles(i),k);
+        if (tri < 0 || tri >= m) continue;
         double d = distance(tri, Proxies_center[i], Proxies_normal[i], V, metric);
         q.push(make_pair(-d, tri+m*(i)));
     }
@@ -262,21 +338,12 @@ void proxy_color(MatrixXi &R, MatrixXd Proxies, MatrixXd V, MatrixXi F, MatrixXi
       for (int k=0;k<3;k++) {
         if (is_feature_barrier(face, k, F, Ad)) continue;
         int tri = Ad(face,k);
+        if (tri < 0 || tri >= m) continue;
         double d = distance(tri, Proxies_center[prox], Proxies_normal[prox], V, metric);
         q.push(make_pair(-d, tri+m*prox));
       }
     }
   }
 
-  // Assign any remaining -1 faces to a neighbor's region
-  for (int i=0; i<m; i++) {
-    if (R(i) >= 0) continue;
-    for (int k=0; k<3; k++) {
-      int nb = Ad(i,k);
-      if (nb >= 0 && R(nb) >= 0) {
-        R(i) = R(nb);
-        break;
-      }
-    }
-  }
+  fill_unassigned_faces_respecting_features(R, F, Ad);
 }

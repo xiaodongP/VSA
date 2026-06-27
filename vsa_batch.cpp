@@ -6,6 +6,7 @@
 #include "proxy_validity.h"
 #include "proxy_classification.h"
 #include "proxy_projection.h"
+#include "vsa_reconstruction.h"
 #include "feature_barrier.h"
 #include "distance.h"
 #include "partitioning.h"
@@ -26,6 +27,64 @@ static double face_area(int fi, const MatrixXi& F, const MatrixXd& V) {
     Vector3i f = F.row(fi);
     return 0.5 * (v3(V.row(f(1))) - v3(V.row(f(0))))
                 .cross(v3(V.row(f(2))) - v3(V.row(f(0)))).norm();
+}
+
+static void ensure_feature_barrier_edges(const MatrixXi& F, const MatrixXi& Ad) {
+    if (!g_feature_barrier_enabled) return;
+    compute_feature_edges(F, Ad, g_feature_angle_threshold);
+}
+
+static int fill_unassigned_faces_respecting_features(MatrixXi& R,
+                                                     const MatrixXi& F,
+                                                     const MatrixXi& Ad) {
+    int m = R.rows();
+    bool changed = true;
+    int assigned = 0;
+
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < m; i++) {
+            if (R(i, 0) >= 0) continue;
+            for (int k = 0; k < 3; k++) {
+                int nb = Ad(i, k);
+                if (nb < 0 || nb >= m || R(nb, 0) < 0) continue;
+                if (is_feature_barrier(i, k, F, Ad)) continue;
+                R(i, 0) = R(nb, 0);
+                assigned++;
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    int crossed_feature_fallbacks = 0;
+    for (int i = 0; i < m; i++) {
+        if (R(i, 0) >= 0) continue;
+        for (int k = 0; k < 3; k++) {
+            int nb = Ad(i, k);
+            if (nb >= 0 && nb < m && R(nb, 0) >= 0) {
+                R(i, 0) = R(nb, 0);
+                assigned++;
+                crossed_feature_fallbacks++;
+                break;
+            }
+        }
+    }
+
+    if (crossed_feature_fallbacks > 0) {
+        cout << "[feature_barrier warning] assigned " << crossed_feature_fallbacks
+             << " faces across feature edges because their feature component had no seed." << endl;
+    }
+    return assigned;
+}
+
+static ProxyValidityConfig full_quadric_validity_config() {
+    ProxyValidityConfig cfg;
+    cfg.enable_basic = true;
+    cfg.enable_degeneracy = true;
+    cfg.enable_classification = true;
+    cfg.enable_two_sheet = true;
+    return cfg;
 }
 
 // ============================================================
@@ -53,7 +112,7 @@ static void flood_regions_quadric(MatrixXi& R, const vector<int>& seeds,
         for (int k = 0; k < 3; k++) {
             if (is_feature_barrier(seeds[i], k, F, Ad)) continue;
             int nb = Ad(seeds[i], k);
-            if (nb < 0) continue;
+            if (nb < 0 || nb >= m) continue;
             double d = face_quadric_error(nb, QP[i], F, V);
             q.push(make_pair(-d, nb + m * i));
         }
@@ -68,23 +127,13 @@ static void flood_regions_quadric(MatrixXi& R, const vector<int>& seeds,
         for (int k = 0; k < 3; k++) {
             if (is_feature_barrier(face, k, F, Ad)) continue;
             int nb = Ad(face, k);
-            if (nb < 0 || R(nb, 0) != -1) continue;
+            if (nb < 0 || nb >= m || R(nb, 0) != -1) continue;
             double d = face_quadric_error(nb, QP[prox], F, V);
             q.push(make_pair(-d, nb + m * prox));
         }
     }
 
-    // Assign any remaining -1 faces to a neighbor's proxy
-    for (int i = 0; i < m; i++) {
-        if (R(i, 0) >= 0) continue;
-        for (int k = 0; k < 3; k++) {
-            int nb = Ad(i, k);
-            if (nb >= 0 && R(nb, 0) >= 0) {
-                R(i, 0) = R(nb, 0);
-                break;
-            }
-        }
-    }
+    fill_unassigned_faces_respecting_features(R, F, Ad);
 }
 
 // ============================================================
@@ -398,7 +447,9 @@ int run_vsa_batch(const string& model_name,
                   int num_proxies, ProxyType proxy_type,
                   int max_iter, unsigned int seed,
                   MatrixXi& R_out,
-                  vector<IterationStats>& stats_out) {
+                  vector<IterationStats>& stats_out,
+                  bool enable_reconstruction,
+                  ReconstructionConfig reconstruction_cfg) {
 
     srand(seed);
 
@@ -410,6 +461,7 @@ int run_vsa_batch(const string& model_name,
 
     MatrixXi Ad = face_adjacency(F, V.rows());
     initialize_normals_areas(F, V);
+    ensure_feature_barrier_edges(F, Ad);
 
     MetricMode metric = L21_METRIC;
 
@@ -449,10 +501,35 @@ int run_vsa_batch(const string& model_name,
             }
         }
 
+        int proxy_count_before_final_check = num_proxies;
+        relabel_boundary_faces_by_normal(R, F, Ad, num_proxies);
+        enforce_feature_barrier_final(R, F, Ad, num_proxies);
+        bool proxies_match_final_regions = (num_proxies == proxy_count_before_final_check);
+        if (!proxies_match_final_regions) {
+            cout << "[final boundary check] region count changed "
+                 << proxy_count_before_final_check << " -> " << num_proxies
+                 << "; proxies are intentionally not refit." << endl;
+        }
+
         string base = model_name + "_quadric_p" + to_string(num_proxies);
         export_colored_mesh(V, F, R, num_proxies, base + "_segmentation.coff");
-        export_proxies_json_quadric(QP, R, F, V, num_proxies, base + "_proxies.json");
+        if (proxies_match_final_regions) {
+            export_proxies_json_quadric(QP, R, F, V, num_proxies, base + "_proxies.json");
+        } else {
+            cout << "[proxies] skipped: final boundary check changed region count; "
+                 << "no proxy refit requested." << endl;
+        }
         export_iteration_log(stats_out, num_proxies, base + "_log.csv");
+        if (enable_reconstruction) {
+            if (proxies_match_final_regions) {
+                cout << "\n=== Quadric Reconstruction Export ===" << endl;
+                reconstructAndExportQuadricVSA(V, F, R, QP, num_proxies,
+                                               reconstruction_cfg, base);
+            } else {
+                cout << "[reconstruct] skipped: final boundary check changed region count; "
+                     << "no proxy refit requested." << endl;
+            }
+        }
         R_out = R;
     }
     else { // PLANE_PROXY
@@ -482,10 +559,28 @@ int run_vsa_batch(const string& model_name,
             }
         }
 
+        int proxy_count_before_final_check = num_proxies;
+        relabel_boundary_faces_by_normal(R, F, Ad, num_proxies);
+        enforce_feature_barrier_final(R, F, Ad, num_proxies);
+        bool proxies_match_final_regions = (num_proxies == proxy_count_before_final_check);
+        if (!proxies_match_final_regions) {
+            cout << "[final boundary check] region count changed "
+                 << proxy_count_before_final_check << " -> " << num_proxies
+                 << "; proxies are intentionally not refit." << endl;
+        }
+
         string base = model_name + "_plane_p" + to_string(num_proxies);
         export_colored_mesh(V, F, R, num_proxies, base + "_segmentation.coff");
-        export_proxies_json_plane(Proxies, num_proxies, R, F, V, metric, base + "_proxies.json");
+        if (proxies_match_final_regions) {
+            export_proxies_json_plane(Proxies, num_proxies, R, F, V, metric, base + "_proxies.json");
+        } else {
+            cout << "[proxies] skipped: final boundary check changed region count; "
+                 << "no proxy refit requested." << endl;
+        }
         export_iteration_log(stats_out, num_proxies, base + "_log.csv");
+        if (enable_reconstruction) {
+            cout << "[reconstruct] skipped: reconstruction requires --proxy-type quadric" << endl;
+        }
         R_out = R;
     }
 
@@ -694,7 +789,7 @@ static set<pair<int,int>> build_region_adjacency(
         if (ri < 0 || ri >= num_proxies) continue;
         for (int k = 0; k < 3; k++) {
             int nb = Ad(fi, k);
-            if (nb <= 0 || nb >= m) continue;
+            if (nb < 0 || nb >= m) continue;
             int rj = R(nb, 0);
             if (rj < 0 || rj >= num_proxies || rj == ri) continue;
             adj.insert(make_pair(min(ri, rj), max(ri, rj)));
@@ -743,6 +838,13 @@ static vector<MergeCandidate> find_merge_candidates(
 
         // Fit proxy for merged region
         QuadricProxy merged = fit_quadric_region(R_tmp, ri, F, V);
+        ProxyValidityReport validity = check_proxy_validity(
+            merged, ri, R_tmp, F, V, full_quadric_validity_config());
+        if (!validity.is_valid || validity.is_suspicious) {
+            ms.reject_reason = "merged_proxy_invalid=" + validity.invalid_reason_str;
+            all_evaluated.push_back(ms);
+            continue;
+        }
         ms.E_t = quadric_region_error(R_tmp, ri, F, V, merged);
 
         double delta = abs(ms.E_t - (ms.E_i + ms.E_j));
@@ -987,7 +1089,9 @@ int run_vsa_progressive(const string& model_name,
                         bool validity_guided,
                         int max_validity_split_attempts,
                         int min_faces_to_split,
-                        bool export_validity_each_step)
+                        bool export_validity_each_step,
+                        bool enable_reconstruction,
+                        ReconstructionConfig reconstruction_cfg)
 {
     srand(seed);
     stats_out.clear();
@@ -1003,6 +1107,7 @@ int run_vsa_progressive(const string& model_name,
 
     MatrixXi Ad = face_adjacency(F, V.rows());
     initialize_normals_areas(F, V);
+    ensure_feature_barrier_edges(F, Ad);
     MetricMode metric = L21_METRIC;
 
     int num_proxies = max(init_proxies, 2);
@@ -1336,27 +1441,46 @@ int run_vsa_progressive(const string& model_name,
             export_smooth_log(smooth_log_out, base + "_boundary_smoothing_log.csv");
     }
 
+    int proxy_count_before_final_check = num_proxies;
+    relabel_boundary_faces_by_normal(R, F, Ad, num_proxies);
+    enforce_feature_barrier_final(R, F, Ad, num_proxies);
+    bool proxies_match_final_regions = (num_proxies == proxy_count_before_final_check);
+    if (!proxies_match_final_regions) {
+        cout << "[final boundary check] region count changed "
+             << proxy_count_before_final_check << " -> " << num_proxies
+             << "; proxies are intentionally not refit." << endl;
+    }
+    base = model_name + "_progressive_" + ptype_str + "_p" + to_string(num_proxies);
+
     export_colored_mesh(V, F, R, num_proxies, base + "_segmentation.coff");
-    if (proxy_type == QUADRIC_PROXY)
-        export_proxies_json_quadric(QP, R, F, V, num_proxies, base + "_proxies.json");
-    else
-        export_proxies_json_plane(Proxies, num_proxies, R, F, V, metric, base + "_proxies.json");
+    if (proxies_match_final_regions) {
+        if (proxy_type == QUADRIC_PROXY)
+            export_proxies_json_quadric(QP, R, F, V, num_proxies, base + "_proxies.json");
+        else
+            export_proxies_json_plane(Proxies, num_proxies, R, F, V, metric, base + "_proxies.json");
+    } else {
+        cout << "[proxies] skipped: final boundary check changed region count; "
+             << "no proxy refit requested." << endl;
+    }
     export_iteration_log(stats_out, num_proxies, base + "_log.csv");
     export_insertion_log(insertion_log_out, base + "_insertion_log.csv");
     if (enable_merge && !merge_log_out.empty())
         export_merge_log(merge_log_out, base + "_merge_log.csv");
 
     // Final validity report
-    if (proxy_type == QUADRIC_PROXY && validity_cfg.enable_basic) {
+    if (proxy_type == QUADRIC_PROXY && validity_cfg.enable_basic && proxies_match_final_regions) {
         auto final_reports = check_all_proxies(QP, R, F, V, validity_cfg);
         cout << "\n=== Final Proxy Validity ===" << endl;
         for (auto& rpt : final_reports) print_proxy_validity(rpt);
         export_proxy_validity_log(final_reports, base + "_proxy_validity_log.csv");
+    } else if (proxy_type == QUADRIC_PROXY && validity_cfg.enable_basic) {
+        cout << "[validity] skipped: final boundary check changed region count; "
+             << "no proxy refit requested." << endl;
     }
 
     // Quadric proxy classification (post-processing only)
     vector<ClassifiedType> proxy_types;
-    if (enable_classify && proxy_type == QUADRIC_PROXY) {
+    if (enable_classify && proxy_type == QUADRIC_PROXY && proxies_match_final_regions) {
         cout << "\n=== Quadric Proxy Classification (eps=" << classify_eps << ") ===" << endl;
         auto class_reports = classify_all_proxies(QP, R, F, V, classify_eps);
         for (auto& rpt : class_reports) print_classification_report(rpt);
@@ -1371,9 +1495,13 @@ int run_vsa_progressive(const string& model_name,
         for (auto& [name, cnt] : type_counts)
             cout << "    " << name << ": " << cnt << endl;
     }
+    else if (enable_classify && proxy_type == QUADRIC_PROXY) {
+        cout << "[classify] skipped: final boundary check changed region count; "
+             << "no proxy refit requested." << endl;
+    }
 
     // Proxy projection (post-processing)
-    if (enable_projection) {
+    if (enable_projection && proxies_match_final_regions) {
         cout << "\n=== Proxy Projection ===" << endl;
 
         // If classification wasn't run but we're in quadric mode, classify now
@@ -1398,6 +1526,25 @@ int run_vsa_progressive(const string& model_name,
         cout << "  success=" << proj_log.success_count
              << " fallback=" << proj_log.fallback_count
              << " failure=" << proj_log.failure_count << endl;
+    }
+    else if (enable_projection) {
+        cout << "[projection] skipped: final boundary check changed region count; "
+             << "no proxy refit requested." << endl;
+    }
+
+    if (enable_reconstruction) {
+        if (proxy_type == QUADRIC_PROXY) {
+            if (proxies_match_final_regions) {
+                cout << "\n=== Quadric Reconstruction Export ===" << endl;
+                reconstructAndExportQuadricVSA(V, F, R, QP, num_proxies,
+                                               reconstruction_cfg, base);
+            } else {
+                cout << "[reconstruct] skipped: final boundary check changed region count; "
+                     << "no proxy refit requested." << endl;
+            }
+        } else {
+            cout << "[reconstruct] skipped: reconstruction requires --proxy-type quadric" << endl;
+        }
     }
 
     R_out = R;

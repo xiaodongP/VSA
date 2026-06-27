@@ -9,6 +9,7 @@
 #include "boundary_smoothing.h"
 #include "proxy_classification.h"
 #include "proxy_projection.h"
+#include "vsa_reconstruction.h"
 
 using namespace Eigen;
 using namespace std;
@@ -73,7 +74,9 @@ int run_vsa_batch(const string& model_name,
                   int num_proxies, ProxyType proxy_type,
                   int max_iter, unsigned int seed,
                   MatrixXi& R_out,
-                  vector<IterationStats>& stats_out);
+                  vector<IterationStats>& stats_out,
+                  bool enable_reconstruction = false,
+                  ReconstructionConfig reconstruction_cfg = ReconstructionConfig());
 
 // Run VSA with progressive proxy insertion.
 // Starts from init_proxies, inserts one proxy at a time until target reached or error threshold met.
@@ -97,7 +100,9 @@ int run_vsa_progressive(const string& model_name,
                         bool validity_guided = false,
                         int max_validity_split_attempts = 20,
                         int min_faces_to_split = 4,
-                        bool export_validity_each_step = false);
+                        bool export_validity_each_step = false,
+                        bool enable_reconstruction = false,
+                        ReconstructionConfig reconstruction_cfg = ReconstructionConfig());
 
 // Run merge pass: iteratively merge adjacent region pairs.
 // Returns number of merged pairs.

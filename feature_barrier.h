@@ -7,6 +7,7 @@
 #include <string>
 #include <queue>
 #include <algorithm>
+#include <map>
 
 using namespace Eigen;
 using namespace std;
@@ -26,6 +27,7 @@ struct EdgeKey {
 // Global feature-edge state
 extern set<EdgeKey> g_feature_edges;
 extern bool g_feature_barrier_enabled;
+extern double g_feature_angle_threshold;
 
 // Compute feature edges via dihedral angle threshold
 // Uses Face_normal from distance.cpp
@@ -40,7 +42,7 @@ VectorXi build_feature_groups(const MatrixXi& F, const MatrixXi& Ad,
 inline bool is_feature_barrier(int fi, int k, const MatrixXi& F, const MatrixXi& Ad) {
     if (!g_feature_barrier_enabled || g_feature_edges.empty()) return false;
     int nb = Ad(fi, k);
-    if (nb < 0) return false;
+    if (nb < 0 || nb >= F.rows()) return false;
     // Compute shared edge (sorted vertex pair) via vertex intersection
     int a = F(fi,0), b = F(fi,1), c = F(fi,2);
     int na = F(nb,0), nbv = F(nb,1), nc = F(nb,2);
@@ -67,5 +69,42 @@ void get_feature_edge_points(const MatrixXi& F, const MatrixXd& V,
 void export_feature_edges_log(const set<EdgeKey>& feature_edges,
                                const MatrixXi& F, const MatrixXd& V,
                                const string& filename);
+
+struct FeatureBarrierEnforceReport {
+    int old_region_count = 0;
+    int new_region_count = 0;
+    int split_region_count = 0;
+    int added_region_count = 0;
+    int violating_feature_edges_before = 0;
+    int violating_feature_edges_after = 0;
+};
+
+struct BoundaryNormalRelabelReport {
+    int boundary_face_count = 0;
+    int relabeled_face_count = 0;
+    int iterations = 0;
+};
+
+// Final cleanup for boundary outlier faces. Reassigns a boundary face to an
+// adjacent region only when the face normal is clearly more consistent with
+// that neighboring region's adjacent faces.
+BoundaryNormalRelabelReport relabel_boundary_faces_by_normal(
+    MatrixXi& R,
+    const MatrixXi& F,
+    const MatrixXi& Ad,
+    int num_regions,
+    double min_improvement = 0.25,
+    double min_candidate_alignment = 0.75,
+    int max_iterations = 2,
+    bool verbose = true);
+
+// Final hard barrier pass: split any region that spans multiple components
+// separated by feature edges. May increase num_regions.
+FeatureBarrierEnforceReport enforce_feature_barrier_final(
+    MatrixXi& R,
+    const MatrixXi& F,
+    const MatrixXi& Ad,
+    int& num_regions,
+    bool verbose = true);
 
 #endif

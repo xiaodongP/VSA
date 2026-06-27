@@ -1,0 +1,1 @@
+corner_loop_indices 0 8 14 22

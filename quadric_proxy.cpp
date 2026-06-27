@@ -154,12 +154,13 @@ QuadricProxy fit_quadric_region(const MatrixXi& R, int region_id,
 
     // Solve generalized eigenvalue problem: M s = lambda N s
     GeneralizedSelfAdjointEigenSolver<MatrixXd> solver(M_mat, N_reg);
+    if (solver.info() != Success) {
+        cerr << "fit_quadric_region: generalized eigen solve failed, returning zero proxy" << endl;
+        return QuadricProxy();
+    }
 
-    VectorXd eigenvalues = solver.eigenvalues();
-    MatrixXd eigenvectors = solver.eigenvectors();
-
-    // Eigenvalues sorted in increasing order — col(0) is the minimum
-    VectorXd s = eigenvectors.col(0);
+    // Eigenvalues sorted in increasing order; col(0) is the minimum.
+    VectorXd s = solver.eigenvectors().col(0);
 
     // Validate: reject NaN/Inf
     bool valid = true;
